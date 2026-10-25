@@ -1,0 +1,26 @@
+# Android / Gradle local output
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing and local credentials
+*.jks
+*.keystore
+keystore.properties
+.env
+.env.*
+
+# Publish APKs through GitHub Releases
+*.apk
+*.aab
+
+# App account/cache data
+account.bin
+snapshot.json

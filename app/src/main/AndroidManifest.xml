@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <queries><package android:name="com.xmcy.hykb" /></queries>
+    <application android:label="范式查查b" android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher" android:allowBackup="false"
+        android:usesCleartextTraffic="false" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.images" android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/share_paths" />
+        </provider>
+    </application>
+</manifest>
