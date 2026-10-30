@@ -130,6 +130,18 @@ class MainModel(application: Application) : AndroidViewModel(application) {
             catch (_: Exception) { mutable.update { it.copy(saveStatus = "error") } }
         }
     }
+    fun refreshArtwork() {
+        if (mutable.value.busy) return
+        viewModelScope.launch {
+            mutable.update { it.copy(busy = true, progress = "正在更新曲库与曲绘") }
+            try {
+                val snapshot = withContext(Dispatchers.IO) { repository.refreshArtwork() }
+                mutable.update { it.copy(snapshot = snapshot, busy = false, report = null,
+                    showReport = false, notice = "曲库已更新，曲绘缓存已刷新；列表和生成图片时按需下载。") }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { mutable.update { it.copy(busy = false, notice = "曲库更新失败，请检查网络后重试。") } }
+        }
+    }
     fun clearAccount() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) { repository.clearAccount() }
@@ -194,6 +206,27 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
     val colors = if(dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val snackbar = remember { SnackbarHostState() }
+    val updates = remember { Updates(context) }
+    val scope = rememberCoroutineScope()
+    var update by remember { mutableStateOf<AppUpdate?>(null) }
+    var updateBusy by remember { mutableStateOf(false) }
+    var author by remember { mutableStateOf(false) }
+    fun openLink(url: String) {
+        context.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+    }
+    fun checkUpdate(manual: Boolean) {
+        if (updateBusy) return
+        updateBusy = true
+        scope.launch {
+            try {
+                update = withContext(Dispatchers.IO) { updates.check(manual) }
+                if (manual && update == null) model.notice("当前没有可用的新版本")
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { if (manual) model.notice("检查更新失败，请检查网络后重试。") }
+            finally { updateBusy = false }
+        }
+    }
+    LaunchedEffect(Unit) { checkUpdate(false) }
     MaterialTheme(colorScheme = colors, shapes = Shapes(medium = RoundedCornerShape(20.dp), large = RoundedCornerShape(28.dp), extraLarge = RoundedCornerShape(32.dp))) {
         LaunchedEffect(state.notice) {
             state.notice?.let { snackbar.showSnackbar(it); model.clearNotice() }
@@ -217,9 +250,43 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
                 when(tab) {
                     0 -> B50Screen(state, modifier, authorize, model::generate, model::update)
                     1 -> ScoresScreen(state, modifier, authorize)
-                    else -> AccountScreen(state, modifier, authorize, model::clearAccount)
+                    else -> AccountScreen(state, modifier, authorize, model::clearAccount,
+                        { openLink(REPOSITORY_URL) }, { checkUpdate(true) }, updateBusy,
+                        model::refreshArtwork, { author = true })
                 }
             }
+        }
+        if (author) AlertDialog(onDismissRequest = { author = false }, title = { Text("关于作者") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("zako00001")
+                Text("邮箱：1708108745@qq.com")
+                Text("QQ：1708108745")
+                TextButton(onClick = { openLink("https://github.com/zako00001") }) { Text("GitHub 主页") }
+            } }, confirmButton = { TextButton(onClick = { author = false }) { Text("关闭") } })
+        update?.let { available ->
+            AlertDialog(onDismissRequest = { if (!updateBusy) update = null },
+                title = { Text("发现新版本 ${available.version}") },
+                text = { Text(if (updateBusy) "正在下载，请稍候…" else "下载后将打开系统安装界面，首次安装需允许本应用安装更新。") },
+                confirmButton = { TextButton(enabled = !updateBusy, onClick = {
+                    updateBusy = true
+                    scope.launch {
+                        try {
+                            val file = withContext(Dispatchers.IO) { updates.download(available) }
+                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.images", file)
+                            context.startActivity(Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, "application/vnd.android.package-archive")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            })
+                            update = null
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { model.notice("下载或安装未成功，请确认网络、安装权限及发布包版本。") }
+                        finally { updateBusy = false }
+                    }
+                }) { Text("下载并安装") } },
+                dismissButton = { Row {
+                    TextButton(enabled = !updateBusy, onClick = { updates.ignore(available); update = null }) { Text("此版本不再提醒") }
+                    TextButton(enabled = !updateBusy, onClick = { update = null }) { Text("取消") }
+                } })
         }
         if(state.showReport && state.report != null) {
             ReportDialog(state, model::closeReport, model::savePicture, { share(state.report!!.file) })
@@ -231,10 +298,8 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
     ElevatedCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(32.dp)) {
         Column(Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
             Image(painterResource(R.drawable.icon_original), null, Modifier.size(72.dp).clip(RoundedCornerShape(24.dp)))
-            Text("你的成绩，一目了然。", style=MaterialTheme.typography.headlineMedium, fontWeight=FontWeight.Bold)
             Text("连接快爆账号，查看真实成绩与 B35 + B15，生成自己的 B50 图片。", style=MaterialTheme.typography.bodyLarge)
             Button(onClick=authorize,enabled=!busy,modifier=Modifier.fillMaxWidth().height(56.dp)) { Text("通过好游快爆授权") }
-            Text("国服 · 无需 root、证书或代理",style=MaterialTheme.typography.labelLarge,color=MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -330,7 +395,9 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
     }
 }
 
-@Composable private fun AccountScreen(state: ScreenState, modifier: Modifier, authorize: () -> Unit, clear: () -> Unit) {
+@Composable private fun AccountScreen(state: ScreenState, modifier: Modifier, authorize: () -> Unit, clear: () -> Unit,
+    repository: () -> Unit, checkUpdate: () -> Unit, updateBusy: Boolean,
+    refreshArtwork: () -> Unit, aboutAuthor: () -> Unit) {
     var confirm by remember { mutableStateOf(false) }
     LazyColumn(modifier,contentPadding=PaddingValues(20.dp),verticalArrangement=Arrangement.spacedBy(20.dp)) {
         item { Busy(state) }
@@ -343,11 +410,15 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
         } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(24.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
             Text("关于范式查查b",style=MaterialTheme.typography.titleLarge,fontWeight=FontWeight.Bold)
-            Text("版本 0.1.0 · 国服 4.12 曲库")
+            Text("版本 ${LocalContext.current.packageManager.getPackageInfo(LocalContext.current.packageName, 0).versionName}")
+            TextButton(onClick=repository) { Text("GitHub 仓库") }
+            TextButton(onClick=checkUpdate, enabled=!updateBusy) { Text(if(updateBusy) "正在检查或下载…" else "检查更新") }
+            TextButton(onClick=refreshArtwork, enabled=!state.busy) { Text("更新曲库与曲绘") }
             Text("B50 = B35 + B15。CHAOTIC 不计入，使用社区定数与分季标记计算。",style=MaterialTheme.typography.bodyMedium)
             Text("定数、曲绘镜像及 Rating 公式参考 PRP；曲绘版权归原作者及游戏方。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             Text("非官方工具，与游戏开发商及好游快爆无隶属关系。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
         } } }
+        item { TextButton(onClick=aboutAuthor) { Text("关于作者") } }
     }
     if(confirm) AlertDialog(onDismissRequest={confirm=false},title={Text("清除本地账号？")},
         text={Text("会移除本机保存的授权和成绩，已保存到相册的图片保留。")},
