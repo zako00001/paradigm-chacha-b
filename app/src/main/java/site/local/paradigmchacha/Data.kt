@@ -8,7 +8,6 @@ import android.net.Uri
 import android.provider.MediaStore
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import coil.imageLoader
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -34,13 +33,13 @@ import kotlin.math.pow
 data class Chart(
     val address: String, val title: String, val artist: String, val difficulty: String,
     val displayLevel: String, val constant: Double, val isNew: Boolean, val id: Int,
-    val coverUrl: String, val coverAsset: String,
+    val coverUrl: String, val coverAsset: String, val downloadedCover: File? = null,
 ) {
     val shortDifficulty get() = when (difficulty) {
         "detected" -> "DET"; "invaded" -> "INV"; "massive" -> "MSV"; "reboot" -> "RBT"
         else -> "CHAOTIC"
     }
-    val imageModel get() = if (coverAsset.isNotEmpty()) "file:///android_asset/$coverAsset" else coverUrl
+    val imageModel get(): Any = downloadedCover ?: if (coverAsset.isNotEmpty()) "file:///android_asset/$coverAsset" else coverUrl
 }
 
 data class Score(val address: String, val score: Int, val flags: Int, val chart: Chart?, val rating: Int) {
@@ -92,16 +91,26 @@ class Repository(private val context: Context) {
     private val avatarFile = File(context.filesDir, "avatar.jpg")
     private val key by lazy { context.assets.open("protocol.bin").use { it.readBytes() } }
     private var chartCache: Map<String, Chart>? = null
-    private val charts: Map<String, Chart> get() = chartCache ?: loadCharts().also { chartCache = it }
-    private fun loadCharts(): Map<String, Chart> {
-        val local = File(context.filesDir, "charts.json")
-        val raw = JSONObject(if (local.exists()) local.readText() else context.assets.open("charts.json").bufferedReader().use { it.readText() }).getJSONObject("charts")
-        return raw.keys().asSequence().associateWith { address ->
+    private fun catalog(): JSONObject {
+        val downloaded = File(context.filesDir, "catalog.json")
+        return if (downloaded.exists()) JSONObject(downloaded.readText())
+        else JSONObject(context.assets.open("charts.json").bufferedReader().use { it.readText() })
+    }
+    private val charts: Map<String, Chart> get() = chartCache ?: run {
+        val raw = catalog().getJSONObject("charts")
+        raw.keys().asSequence().associateWith { address ->
             val c = raw.getJSONObject(address)
             Chart(address, c.getString("title"), c.getString("artist"), c.getString("difficulty"),
                 c.getString("displayLevel"), c.getDouble("constant"), c.getBoolean("b15"), c.getInt("id"),
-                c.getString("coverUrl"), if (context.getSharedPreferences("artwork", Context.MODE_PRIVATE).getBoolean("remote", false)) "" else c.optString("coverAsset"))
-        }
+                c.getString("coverUrl"), c.optString("coverAsset"), coverFile(context, c.getString("coverUrl")).takeIf { it.exists() })
+        }.also { chartCache = it }
+    }
+
+    fun updateCovers(progress: (String) -> Unit): CatalogResult {
+        val played = cached()?.scores?.map { it.address }?.toSet().orEmpty()
+        val result = CatalogUpdates(context).refresh(catalog(), played, progress)
+        chartCache = null
+        return result
     }
 
     fun hasAccount() = accounts.read() != null
@@ -235,7 +244,9 @@ class Repository(private val context: Context) {
     }
 
     fun cover(chart: Chart): Bitmap? {
-        if (chart.coverAsset.isNotBlank() && !context.getSharedPreferences("artwork", Context.MODE_PRIVATE).getBoolean("remote", false)) return context.assets.open(chart.coverAsset).use { BitmapFactory.decodeStream(it) }
+        val downloaded = coverFile(context, chart.coverUrl)
+        if (downloaded.exists()) return BitmapFactory.decodeFile(downloaded.path)
+        if (chart.coverAsset.isNotBlank()) return context.assets.open(chart.coverAsset).use { BitmapFactory.decodeStream(it) }
         val hash = MessageDigest.getInstance("SHA-256").digest(chart.coverUrl.toByteArray()).joinToString("") { "%02x".format(it) }
         val file = File(context.cacheDir, "covers/$hash.jpg")
         if (!file.exists()) {
@@ -243,28 +254,6 @@ class Repository(private val context: Context) {
             catch (_: java.io.IOException) { return null }
         }
         return BitmapFactory.decodeFile(file.path)
-    }
-
-    fun refreshArtwork(): Snapshot? {
-        val bytes = getBytes("https://raw.githubusercontent.com/zako00001/paradigm-chacha-b/main/app/src/main/assets/charts.json")
-        val raw = JSONObject(String(bytes, Charsets.UTF_8)).getJSONObject("charts")
-        require(raw.length() > 0)
-        raw.keys().forEach { address ->
-            val c = raw.getJSONObject(address)
-            c.getString("title"); c.getString("artist"); c.getString("difficulty")
-            c.getString("displayLevel"); require(c.getDouble("constant").isFinite())
-            c.getBoolean("b15"); c.getInt("id")
-            require(c.getString("coverUrl").startsWith("https://"))
-        }
-        val pending = File(context.filesDir, "charts.pending")
-        pending.writeBytes(bytes)
-        check(pending.renameTo(File(context.filesDir, "charts.json")))
-        chartCache = null
-        File(context.cacheDir, "covers").deleteRecursively()
-        context.imageLoader.memoryCache?.clear()
-        context.imageLoader.diskCache?.clear()
-        context.getSharedPreferences("artwork", Context.MODE_PRIVATE).edit().putBoolean("remote", true).commit()
-        return cached()
     }
 
     fun render(snapshot: Snapshot): Rendered = B50Renderer(context, this).render(snapshot)
