@@ -15,6 +15,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
@@ -53,6 +61,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
@@ -77,18 +86,30 @@ data class ScreenState(val snapshot: Snapshot? = null, val hasAccount: Boolean =
     val report: Rendered? = null, val showReport: Boolean = false, val saveStatus: String = "",
     val checkingUpdate: Boolean = false, val release: AppRelease? = null, val showUpdate: Boolean = false,
     val downloadPercent: Int? = null, val updateMessage: String? = null, val installFile: File? = null,
-    val updatingCovers: Boolean = false, val coverProgress: String = "")
+    val updatingCovers: Boolean = false, val coverProgress: String = "",
+    val manualMode: Boolean = false, val manualSnapshot: Snapshot? = null, val manualCharts: List<Chart> = emptyList(),
+    val themeMode: String = "system") {
+    val currentSnapshot get() = if (manualMode) manualSnapshot else snapshot
+}
 
 class MainModel(application: Application) : AndroidViewModel(application) {
     private val repository = Repository(application)
     private val updates = AppUpdates(application)
+    private val preferences = application.getSharedPreferences("score-mode", 0)
     private val mutable = MutableStateFlow(ScreenState())
     val state = mutable.asStateFlow()
     init {
         viewModelScope.launch {
             try {
-                val loaded = withContext(Dispatchers.IO) { repository.cached() to repository.hasAccount() }
-                mutable.update { it.copy(snapshot = loaded.first, hasAccount = loaded.second, busy = false) }
+                withContext(Dispatchers.IO) {
+                    val automatic = repository.cached()
+                    val hasAccount = repository.hasAccount()
+                    val manual = repository.manualSnapshot()
+                    val charts = repository.manualCharts()
+                    mutable.update { it.copy(snapshot = automatic, hasAccount = hasAccount, manualSnapshot = manual,
+                        manualCharts = charts, manualMode = preferences.getBoolean("manual", false),
+                        themeMode = preferences.getString("theme", "system") ?: "system", busy = false) }
+                }
             } catch (_: Exception) { mutable.update { it.copy(busy = false, notice = "本地账号无法读取，请重新授权。") } }
         }
     }
@@ -114,8 +135,32 @@ class MainModel(application: Application) : AndroidViewModel(application) {
     }
     fun authorize(credential: JSONObject) = fetch { repository.authorize(credential, ::progress) }
     fun update() = fetch { repository.update(::progress) }
+    fun setManualMode(manual: Boolean) {
+        if (mutable.value.busy || mutable.value.updatingCovers) return
+        preferences.edit().putBoolean("manual", manual).apply()
+        mutable.update { it.copy(manualMode = manual, report = null, showReport = false, saveStatus = "") }
+    }
+    fun setThemeMode(theme: String) {
+        if(theme !in listOf("system", "light", "dark")) return
+        preferences.edit().putString("theme", theme).apply()
+        mutable.update { it.copy(themeMode = theme) }
+    }
+    private fun editManual(block: () -> Snapshot) {
+        if (mutable.value.busy || mutable.value.updatingCovers) return
+        viewModelScope.launch {
+            mutable.update { it.copy(busy = true, progress = "正在保存手动记录") }
+            try {
+                val snapshot = withContext(Dispatchers.IO) { block() }
+                mutable.update { it.copy(manualSnapshot = snapshot, busy = false, report = null, showReport = false, notice = "手动记录已保存到本机") }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (e: Exception) { mutable.update { it.copy(busy = false, notice = if(e is AppError) e.message else "手动记录保存失败，请重试。") } }
+        }
+    }
+    fun saveManualPlayer(name: String, tag: String) = editManual { repository.saveManualPlayer(name, tag) }
+    fun saveManualScore(address: String, score: Int, flags: Int) = editManual { repository.saveManualScore(address, score, flags) }
+    fun deleteManualScore(address: String) = editManual { repository.deleteManualScore(address) }
     fun generate() {
-        val snapshot = mutable.value.snapshot ?: return
+        val snapshot = mutable.value.currentSnapshot ?: return
         if (mutable.value.busy || mutable.value.updatingCovers) return
         viewModelScope.launch {
             mutable.update { it.copy(busy = true, progress = "正在生成 B50 图片") }
@@ -192,11 +237,12 @@ class MainModel(application: Application) : AndroidViewModel(application) {
             try {
                 val result = withContext(Dispatchers.IO) {
                     val count = repository.updateCovers { message -> mutable.update { it.copy(coverProgress = message) } }
-                    count to repository.cached()
+                    Triple(count, repository.cached(), repository.manualSnapshot()) to repository.manualCharts()
                 }
-                val count = result.first
-                mutable.update { it.copy(snapshot = result.second, updatingCovers = false, report = null, showReport = false,
-                    notice = "已同步 ${count.charts} 张谱面，更新 ${count.covers} 张曲绘" +
+                val count = result.first.first
+                mutable.update { it.copy(snapshot = result.first.second, manualSnapshot = result.first.third, manualCharts = result.second,
+                    updatingCovers = false, report = null, showReport = false,
+                    notice = "已同步 ${count.charts} 张谱面，更新 ${count.covers} 张曲绘，复用 ${count.reused} 张，清理 ${count.removed} 个旧缓存" +
                         if(count.failed>0) "，${count.failed} 张暂未下载成功，可稍后重试。" else "。") }
             } catch(cancelled: CancellationException) { throw cancelled }
             catch(e: Exception) { mutable.update { it.copy(updatingCovers = false,
@@ -278,9 +324,26 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> Unit, install: (File) -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
-    val dark = isSystemInDarkTheme()
+    val systemDark = isSystemInDarkTheme()
+    val dark = when(state.themeMode) { "light" -> false; "dark" -> true; else -> systemDark }
     val context = LocalContext.current
-    val colors = if(dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    val palette = if(dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    val background by animateColorAsState(palette.background,tween(280),label="themeBackground")
+    val surface by animateColorAsState(palette.surface,tween(280),label="themeSurface")
+    val onSurface by animateColorAsState(palette.onSurface,tween(280),label="themeText")
+    val surfaceContainer by animateColorAsState(palette.surfaceContainer,tween(280),label="themeContainer")
+    val primaryContainer by animateColorAsState(palette.primaryContainer,tween(280),label="themePrimaryContainer")
+    val onPrimaryContainer by animateColorAsState(palette.onPrimaryContainer,tween(280),label="themePrimaryText")
+    val colors = palette.copy(background=background,surface=surface,onSurface=onSurface,onBackground=onSurface,
+        surfaceContainer=surfaceContainer,primaryContainer=primaryContainer,onPrimaryContainer=onPrimaryContainer)
+    SideEffect {
+        (context as? android.app.Activity)?.let { activity ->
+            WindowCompat.getInsetsController(activity.window,activity.window.decorView).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        }
+    }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.installFile) {
@@ -291,8 +354,8 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
             state.notice?.let { snackbar.showSnackbar(it); model.clearNotice() }
         }
         Scaffold(
-            topBar = { LargeTopAppBar(title = { Text("范式查查b", fontWeight = FontWeight.Bold) }, actions = {
-                if(state.hasAccount) IconButton(onClick = model::update, enabled = !state.busy && !state.updatingCovers) {
+            topBar = { TopAppBar(title = { Text("范式查查b", fontWeight = FontWeight.Bold) }, actions = {
+                if(state.hasAccount && !state.manualMode) IconButton(onClick = model::update, enabled = !state.busy && !state.updatingCovers) {
                     Icon(Icons.Default.Refresh, contentDescription = "更新成绩")
                 }
             }) },
@@ -305,12 +368,27 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
             snackbarHost = { SnackbarHost(snackbar) },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.TopCenter) {
-                val modifier = Modifier.widthIn(max = 840.dp).fillMaxSize()
-                when(tab) {
-                    0 -> B50Screen(state, modifier, authorize, model::generate, model::update)
-                    1 -> ScoresScreen(state, modifier, authorize)
-                    else -> AccountScreen(state, modifier, authorize, model::clearAccount,
-                        { model.checkUpdate() }, model::updateCovers)
+                Column(Modifier.widthIn(max = 840.dp).fillMaxSize()) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal=20.dp),horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+                        FilterChip(selected=!state.manualMode,onClick={model.setManualMode(false)},enabled=!state.busy && !state.updatingCovers,label={Text("国服自动查分")})
+                        FilterChip(selected=state.manualMode,onClick={model.setManualMode(true)},enabled=!state.busy && !state.updatingCovers,label={Text("手动录分")})
+                    }
+                    AnimatedContent(targetState=tab to state.manualMode,modifier=Modifier.fillMaxWidth().weight(1f),
+                        transitionSpec={
+                            val direction=if(targetState.first>=initialState.first)1 else -1
+                            (fadeIn(tween(200,40))+slideInHorizontally(spring(dampingRatio=.9f,stiffness=360f)){it/12*direction})
+                                .togetherWith(fadeOut(tween(120))+slideOutHorizontally(tween(200)){-it/16*direction})
+                        },label="mainNavigation") { (page,manual) ->
+                        val pageState=state.copy(manualMode=manual)
+                        val modifier=Modifier.fillMaxSize()
+                        when(page) {
+                            0 -> B50Screen(pageState, modifier, authorize, model::generate, model::update, {tab=1})
+                            1 -> if(manual) ManualScoresScreen(pageState, modifier, model::saveManualPlayer, model::saveManualScore, model::deleteManualScore)
+                                else ScoresScreen(pageState, modifier, authorize)
+                            else -> SettingsScreen(pageState, modifier, authorize, model::clearAccount,
+                                { model.checkUpdate() }, model::updateCovers, model::setThemeMode)
+                        }
+                    }
                 }
             }
         }
@@ -350,19 +428,20 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
                 }
                 Column(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(3.dp)) {
                     Text(snapshot.player.name,style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.Bold)
-                    Text("#${snapshot.player.tag} · 国服",style=MaterialTheme.typography.bodyMedium)
+                    Text("#${snapshot.player.tag} · ${if(snapshot.manual) "手动录分" else "国服"}",style=MaterialTheme.typography.bodyMedium)
                 }
             }
             Text("%.4f".format(Locale.US,snapshot.totalRating),fontSize=42.sp,fontWeight=FontWeight.Bold,fontFamily=FontFamily.Monospace)
             Text("B35 ${snapshot.b35.size}/35  ·  B15 ${snapshot.b15.size}/15  ·  本地计算",style=MaterialTheme.typography.labelLarge)
-            Text("游戏 Rating  %.4f".format(Locale.US,snapshot.player.officialRating),style=MaterialTheme.typography.bodyMedium)
+            if(!snapshot.manual) Text("游戏 Rating  %.4f".format(Locale.US,snapshot.player.officialRating),style=MaterialTheme.typography.bodyMedium)
+            else Text("基于手动记录与社区定数计算",style=MaterialTheme.typography.bodyMedium)
         }
     }
 }
 
-@Composable private fun B50Screen(state: ScreenState, modifier: Modifier, authorize: () -> Unit, generate: () -> Unit, update: () -> Unit) {
+@Composable private fun B50Screen(state: ScreenState, modifier: Modifier, authorize: () -> Unit, generate: () -> Unit, update: () -> Unit, editManual: () -> Unit) {
     var pool by rememberSaveable { mutableIntStateOf(0) }
-    val snapshot = state.snapshot
+    val snapshot = state.currentSnapshot
     LazyColumn(modifier,contentPadding=PaddingValues(20.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
         item { Busy(state) }
         if(snapshot==null) {
@@ -370,29 +449,28 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
             if(state.hasAccount) item { OutlinedButton(onClick=update,enabled=!state.busy && !state.updatingCovers) { Text("重新更新成绩") } }
         } else {
             item { PlayerCard(snapshot) }
-            item { Button(onClick=generate,enabled=!state.busy && !state.updatingCovers,modifier=Modifier.fillMaxWidth().height(56.dp)) {
+            if(snapshot.manual) item { FilledTonalButton(onClick=editManual,enabled=!state.busy && !state.updatingCovers,modifier=Modifier.fillMaxWidth().height(52.dp)) { Text("录入 / 管理手动成绩") } }
+            item { Button(onClick=generate,enabled=!state.busy && !state.updatingCovers && snapshot.scores.any { it.score>0 && it.chart!=null },modifier=Modifier.fillMaxWidth().height(56.dp)) {
                 Icon(Icons.Default.Star,null,Modifier.size(20.dp));Spacer(Modifier.width(10.dp));Text("生成 B50 图片")
             } }
-            item { Text("${snapshot.scores.size} 条真实成绩 · ${time(snapshot.syncedAt)} 更新",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant) }
+            item { Text("${snapshot.scores.size} 条${if(snapshot.manual) "手动记录" else "真实成绩"} · ${time(snapshot.syncedAt)} 更新",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant) }
+            if(snapshot.manual) item { Text("不满 50 条也可生成；新曲取前 15、旧曲取前 35，缺少的位置不以其他组补齐。",style=MaterialTheme.typography.bodySmall) }
             if(snapshot.missingCharts>0) item { Text("${snapshot.missingCharts} 张谱面暂未收录，未计入 B50。",color=MaterialTheme.colorScheme.error) }
             item { Row(horizontalArrangement=Arrangement.spacedBy(12.dp)) {
                 FilterChip(selected=pool==0,onClick={pool=0},label={Text("B15 · 新曲 ${snapshot.b15.size}")})
                 FilterChip(selected=pool==1,onClick={pool=1},label={Text("B35 · 旧曲 ${snapshot.b35.size}")})
             } }
             val selected = if(pool==0)snapshot.b15 else snapshot.b35
-            items(selected,key={it.address}) { score -> ScoreRow(score,selected.indexOf(score)+1) }
+            items(selected,key={it.address}) { score -> Box(Modifier.animateItem()) { ScoreRow(score,selected.indexOf(score)+1) } }
             item { Text("依据社区定数与分组规则计算，图片标记为候选 B50。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant) }
         }
     }
 }
 
-@Composable private fun ScoreRow(score: Score, rank: Int? = null) {
+@Composable internal fun ScoreRow(score: Score, rank: Int? = null) {
     Surface(shape=RoundedCornerShape(22.dp),color=MaterialTheme.colorScheme.surfaceContainer) {
         Row(Modifier.fillMaxWidth().padding(14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
-            if(score.chart!=null) AsyncImage(ImageRequest.Builder(LocalContext.current).data(score.chart.imageModel)
-                .memoryCacheKey(score.chart.downloadedCover?.let { "${it.path}:${it.lastModified()}" } ?: score.chart.imageModel.toString())
-                .build(),null,Modifier.size(72.dp).clip(RoundedCornerShape(16.dp)),contentScale=ContentScale.Crop)
-            else Box(Modifier.size(72.dp).clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest),contentAlignment=Alignment.Center) { Icon(Icons.Default.Info,null) }
+            ChartCover(score.chart,Modifier.size(72.dp))
             Column(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(5.dp)) {
                 Text((rank?.let { "#$it  " } ?: "")+score.title,maxLines=1,overflow=TextOverflow.Ellipsis,fontWeight=FontWeight.SemiBold)
                 Text("${score.chart?.shortDifficulty ?: score.address.substringAfterLast('/').uppercase()} ${score.chart?.displayLevel.orEmpty()}  ·  ${score.status}",style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
@@ -423,67 +501,6 @@ private fun ChachaApp(model: MainModel, authorize: () -> Unit, share: (File) -> 
             items(scores,key={it.address}) { ScoreRow(it) }
         }
     }
-}
-
-@Composable private fun AccountScreen(state: ScreenState, modifier: Modifier, authorize: () -> Unit, clear: () -> Unit,
-    checkUpdate: () -> Unit, updateCovers: () -> Unit) {
-    var confirm by remember { mutableStateOf(false) }
-    var showAuthor by rememberSaveable { mutableStateOf(false) }
-    val context = LocalContext.current
-    fun browse(url: String) {
-        try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-            selector = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_BROWSER)
-        }) }
-        catch (_: android.content.ActivityNotFoundException) { android.widget.Toast.makeText(context,"未找到浏览器",android.widget.Toast.LENGTH_SHORT).show() }
-    }
-    LazyColumn(modifier,contentPadding=PaddingValues(20.dp),verticalArrangement=Arrangement.spacedBy(20.dp)) {
-        item { Busy(state) }
-        if(state.snapshot!=null) item { PlayerCard(state.snapshot) }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(24.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
-            Text("账号",style=MaterialTheme.typography.titleLarge,fontWeight=FontWeight.Bold)
-            Text("授权与成绩只保存在本机。通过好游快爆授权后，可随时更新国服成绩。")
-            FilledTonalButton(onClick=authorize,enabled=!state.busy && !state.updatingCovers,modifier=Modifier.fillMaxWidth().height(52.dp)) { Text(if(state.hasAccount)"重新授权快爆账号" else "通过好游快爆授权") }
-            if(state.hasAccount) TextButton(onClick={confirm=true},enabled=!state.busy && !state.updatingCovers) { Text("退出并清除本地账号",color=MaterialTheme.colorScheme.error) }
-        } } }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(24.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-            Text("软件与资源",style=MaterialTheme.typography.titleLarge,fontWeight=FontWeight.Bold)
-            Text("当前版本 ${BuildConfig.VERSION_NAME}",style=MaterialTheme.typography.bodyMedium)
-            OutlinedButton(onClick={browse(PROJECT_URL)},modifier=Modifier.fillMaxWidth()) { Text("GitHub 仓库") }
-            Text(PROJECT_URL,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.primary,
-                modifier=Modifier.clickable { browse(PROJECT_URL) })
-            FilledTonalButton(onClick=checkUpdate,enabled=!state.checkingUpdate && state.downloadPercent==null,
-                modifier=Modifier.fillMaxWidth().height(52.dp)) { Text(if(state.checkingUpdate) "正在检查更新…" else "检查软件更新") }
-            Text("每次打开软件自动检查，可取消或不再提醒某个版本。",style=MaterialTheme.typography.bodySmall)
-            HorizontalDivider()
-            FilledTonalButton(onClick=updateCovers,enabled=!state.busy && !state.updatingCovers,
-                modifier=Modifier.fillMaxWidth().height(52.dp)) { Text(if(state.updatingCovers) "正在更新曲绘…" else "更新曲库与曲绘") }
-            if(state.updatingCovers) {
-                LinearProgressIndicator(Modifier.fillMaxWidth())
-                Text(state.coverProgress,style=MaterialTheme.typography.bodySmall)
-            }
-            Text("同步 PRP 社区曲库并刷新已游玩曲绘，其他曲绘按需下载。新曲收录以社区镜像为准。",style=MaterialTheme.typography.bodySmall)
-        } } }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(24.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-            Text("关于范式查查b",style=MaterialTheme.typography.titleLarge,fontWeight=FontWeight.Bold)
-            Text("版本 ${BuildConfig.VERSION_NAME} · 国服")
-            Text("B50 = B35 + B15。CHAOTIC 不计入，使用社区定数与分季标记计算。",style=MaterialTheme.typography.bodyMedium)
-            Text("定数、曲绘镜像及 Rating 公式参考 PRP；曲绘版权归原作者及游戏方。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-            Text("非官方工具，与游戏开发商及好游快爆无隶属关系。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-        } } }
-        item { OutlinedButton(onClick={showAuthor=true},modifier=Modifier.fillMaxWidth().height(52.dp)) { Text("关于作者") } }
-    }
-    if(confirm) AlertDialog(onDismissRequest={confirm=false},title={Text("清除本地账号？")},
-        text={Text("会移除本机保存的授权和成绩，已保存到相册的图片保留。")},
-        confirmButton={TextButton(onClick={confirm=false;clear()}){Text("清除")}},dismissButton={TextButton(onClick={confirm=false}){Text("取消")}})
-    if(showAuthor) AlertDialog(onDismissRequest={showAuthor=false},title={Text("关于作者")},text={
-        Column(verticalArrangement=Arrangement.spacedBy(14.dp)) {
-            Text("zako00001",style=MaterialTheme.typography.titleLarge,fontWeight=FontWeight.Bold)
-            Text("邮箱：1708108745@qq.com")
-            Text("QQ：1708108745")
-            Text(AUTHOR_URL,color=MaterialTheme.colorScheme.primary,modifier=Modifier.clickable { browse(AUTHOR_URL) })
-        }
-    },confirmButton={TextButton(onClick={browse(AUTHOR_URL)}){Text("GitHub 主页")}},
-        dismissButton={TextButton(onClick={showAuthor=false}){Text("关闭")}})
 }
 
 @Composable private fun UpdateDialog(state: ScreenState, download: () -> Unit, cancel: () -> Unit, ignore: () -> Unit) {

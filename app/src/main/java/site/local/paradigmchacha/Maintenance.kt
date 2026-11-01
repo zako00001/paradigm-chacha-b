@@ -47,7 +47,7 @@ private fun fetch(url: String): ByteArray {
     } finally { c.disconnect() }
 }
 
-private fun writeAtomic(file: File, bytes: ByteArray) {
+internal fun writeAtomic(file: File, bytes: ByteArray) {
     file.parentFile!!.mkdirs()
     val atomic = AtomicFile(file)
     val stream = atomic.startWrite()
@@ -148,10 +148,76 @@ class AppUpdates(private val context: Context) {
     }
 }
 
-data class CatalogResult(val charts: Int, val covers: Int, val failed: Int)
+data class CatalogResult(val charts: Int, val covers: Int, val failed: Int, val reused: Int, val removed: Int)
 
 /** 同步社区谱面与已游玩封面；没有映射的未来游戏 ID 仍显示为未收录。 */
 class CatalogUpdates(private val context: Context) {
+    private val cacheHeaders = context.getSharedPreferences("cover-cache-headers", Context.MODE_PRIVATE)
+
+    /** 返回是否更新内容。只有本地仍有可用图片时才发送条件请求。 */
+    private fun refreshCover(url: String, asset: String): Boolean {
+        val target = coverFile(context, url)
+        val legacy = File(context.cacheDir, "covers/${target.name}")
+        val bundled = if(asset.isNotBlank()) context.assets.open(asset).use { it.readBytes() } else null
+        val previous = when {
+            target.exists() -> target.readBytes()
+            legacy.exists() -> legacy.readBytes()
+            else -> bundled
+        }
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        val validLocal = previous?.let {
+            BitmapFactory.decodeByteArray(it, 0, it.size, options)
+            options.outWidth > 0 && options.outHeight > 0
+        } == true
+        val key = target.nameWithoutExtension
+        val c = connection(url)
+        try {
+            if(validLocal) {
+                cacheHeaders.getString("$key.etag", null)?.takeIf { it.isNotBlank() }?.let { c.setRequestProperty("If-None-Match", it) }
+                cacheHeaders.getLong("$key.modified", 0).takeIf { it > 0 }?.let { c.ifModifiedSince = it }
+            }
+            val code = c.responseCode
+            if(code == HttpURLConnection.HTTP_NOT_MODIFIED && validLocal) {
+                if(!target.exists() && legacy.exists()) {
+                    writeAtomic(target, previous!!)
+                    legacy.delete()
+                }
+                return false
+            }
+            if(code != HttpURLConnection.HTTP_OK) throw IOException("HTTP $code")
+            val bytes = c.inputStream.use { it.readBytes() }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+            if(options.outWidth <= 0 || options.outHeight <= 0) throw IOException("invalid image")
+            if(bundled != null && bytes.contentEquals(bundled)) {
+                // 与随包图片相同，直接使用素材，移除多余的下载副本。
+                target.delete()
+            } else if(!target.exists() || !bytes.contentEquals(previous)) {
+                writeAtomic(target, bytes)
+            }
+            legacy.delete()
+            cacheHeaders.edit().putString("$key.etag", c.getHeaderField("ETag"))
+                .putLong("$key.modified", c.lastModified).apply()
+            return previous == null || !bytes.contentEquals(previous)
+        } finally { c.disconnect() }
+    }
+
+    /** 只清理本应用生成的哈希命名曲绘，按完整曲库保留，并移除旧目录中的重复副本。 */
+    private fun pruneCovers(charts: JSONObject): Int {
+        val names = charts.keys().asSequence().map { coverFile(context, charts.getJSONObject(it).getString("coverUrl")).name }.toSet()
+        val generated = Regex("[0-9a-f]{64}\\.jpg")
+        var removed = 0
+        for(folder in listOf(File(context.filesDir, "covers"), File(context.cacheDir, "covers"))) {
+            folder.listFiles()?.filter { it.isFile && generated.matches(it.name) }?.forEach { file ->
+                val redundant = folder.parentFile == context.cacheDir && File(context.filesDir, "covers/${file.name}").exists()
+                if((file.name !in names || redundant) && file.delete()) removed++
+            }
+        }
+        val retained = names.map { it.removeSuffix(".jpg") }.toSet()
+        val edit = cacheHeaders.edit()
+        cacheHeaders.all.keys.filter { it.substringBefore('.') !in retained }.forEach { edit.remove(it) }
+        edit.apply()
+        return removed
+    }
     private fun normalized(value: String) = Normalizer.normalize(value, Normalizer.Form.NFKC)
         .lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
 
@@ -193,20 +259,18 @@ class CatalogUpdates(private val context: Context) {
                 .put("coverAsset", if (previous?.optString("coverUrl") == url) previous.optString("coverAsset") else ""))
         }
         val catalog = JSONObject().put("source", CATALOG_URL).put("updatedAt", System.currentTimeMillis()).put("charts", merged)
-        val urls = played.mapNotNull { merged.optJSONObject(it)?.getString("coverUrl") }.distinct()
-        var saved = 0; var failed = 0
-        urls.forEachIndexed { index, url ->
-            progress("正在更新曲绘 ${index + 1}/${urls.size}")
+        val covers = played.mapNotNull { merged.optJSONObject(it) }.associate {
+            it.getString("coverUrl") to it.optString("coverAsset")
+        }
+        var saved = 0; var failed = 0; var reused = 0
+        covers.entries.forEachIndexed { index, (url, asset) ->
+            progress("正在检查曲绘 ${index + 1}/${covers.size}")
             try {
-                val bytes = fetch(url)
-                val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-                if (options.outWidth <= 0 || options.outHeight <= 0) throw IOException("invalid image")
-                writeAtomic(coverFile(context, url), bytes); saved++
+                if(refreshCover(url, asset)) saved++ else reused++
             } catch (_: IOException) { failed++ }
         }
         // 完成同步后原子替换；下载封面失败不破坏已有文件。
         writeAtomic(File(context.filesDir, "catalog.json"), catalog.toString().toByteArray(Charsets.UTF_8))
-        return CatalogResult(merged.length(), saved, failed)
+        return CatalogResult(merged.length(), saved, failed, reused, pruneCovers(merged))
     }
 }

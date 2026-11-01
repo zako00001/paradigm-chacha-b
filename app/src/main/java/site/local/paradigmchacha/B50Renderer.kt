@@ -19,7 +19,7 @@ import java.util.TimeZone
 
 data class Rendered(val file: File, val missingCovers: Int)
 
-/** 现有 B50 模板的 Android Canvas 实现。所有文字来自已授权的真实数据。 */
+/** B50 模板的 Android Canvas 实现；自动同步与手动录分均使用数据填充。 */
 class B50Renderer(private val context: Context, private val repository: Repository) {
     private lateinit var canvas: Canvas
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
@@ -125,7 +125,7 @@ class B50Renderer(private val context: Context, private val repository: Reposito
         line(94f,190f,94f,314f,"#b7bdcf");line(218f,190f,218f,314f,"#b7bdcf")
         text(snapshot.player.name,252f,188f,48f,bold=true,maxWidth=500f)
         text("#${snapshot.player.tag}",252f,257f,27f,muted,number=true)
-        text("CN SERVER  /  BEST 50",252f,300f,17f,muted)
+        text(if(snapshot.manual) "MANUAL INPUT  /  BEST 50" else "CN SERVER  /  BEST 50",252f,300f,17f,muted)
         text("PLAYER RATING",1173f,191f,24f,"#f0dca7")
         text("%.4f".format(Locale.US,snapshot.totalRating),1680f,225f,81f,align=Paint.Align.RIGHT,number=true,bold=true)
         text("本地计算 · 社区定数",1728f,333f,16f,muted,Paint.Align.RIGHT)
@@ -137,7 +137,7 @@ class B50Renderer(private val context: Context, private val repository: Reposito
         line(72f,3037f,1728f,3037f,"#636180")
         text("范式查查b  /  B50 = B35 + B15",72f,3060f,25f)
         val date = SimpleDateFormat("yyyy.MM.dd HH:mm",Locale.CHINA).apply { timeZone=TimeZone.getTimeZone("Asia/Shanghai") }
-        text("候选 B50 · 非官方输出  |  数据 ${date.format(Date(snapshot.syncedAt))}",1728f,3056f,22f,muted,Paint.Align.RIGHT)
+        text("${if(snapshot.manual) "手动录分" else "候选 B50"} · 非官方输出  |  数据 ${date.format(Date(snapshot.syncedAt))}",1728f,3056f,22f,muted,Paint.Align.RIGHT)
         val file = File(context.cacheDir,"reports/b50.png")
         file.parentFile!!.mkdirs()
         file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG,100,it) }

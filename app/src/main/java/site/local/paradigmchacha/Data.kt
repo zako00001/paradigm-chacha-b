@@ -39,7 +39,7 @@ data class Chart(
         "detected" -> "DET"; "invaded" -> "INV"; "massive" -> "MSV"; "reboot" -> "RBT"
         else -> "CHAOTIC"
     }
-    val imageModel get(): Any = downloadedCover ?: if (coverAsset.isNotEmpty()) "file:///android_asset/$coverAsset" else coverUrl
+    val imageModel get(): Any = downloadedCover?.takeIf { it.exists() } ?: if (coverAsset.isNotEmpty()) "file:///android_asset/$coverAsset" else coverUrl
 }
 
 data class Score(val address: String, val score: Int, val flags: Int, val chart: Chart?, val rating: Int) {
@@ -48,7 +48,7 @@ data class Score(val address: String, val score: Int, val flags: Int, val chart:
 }
 
 data class Player(val name: String, val tag: String, val officialRating: Double, val avatar: File?)
-data class Snapshot(val player: Player, val scores: List<Score>, val syncedAt: Long) {
+data class Snapshot(val player: Player, val scores: List<Score>, val syncedAt: Long, val manual: Boolean = false) {
     private val eligible = scores.filter { it.chart != null && !it.address.endsWith("/chaotic") && it.score > 0 }
         .sortedWith(compareByDescending<Score> { it.rating }.thenByDescending { it.chart!!.id })
     val b15 = eligible.filter { it.chart!!.isNew }.take(15)
@@ -88,6 +88,7 @@ private class AccountStore(private val context: Context) {
 class Repository(private val context: Context) {
     private val accounts = AccountStore(context)
     private val snapshotFile = File(context.filesDir, "snapshot.json")
+    private val manualFile = File(context.filesDir, "manual-scores.json")
     private val avatarFile = File(context.filesDir, "avatar.jpg")
     private val key by lazy { context.assets.open("protocol.bin").use { it.readBytes() } }
     private var chartCache: Map<String, Chart>? = null
@@ -102,12 +103,12 @@ class Repository(private val context: Context) {
             val c = raw.getJSONObject(address)
             Chart(address, c.getString("title"), c.getString("artist"), c.getString("difficulty"),
                 c.getString("displayLevel"), c.getDouble("constant"), c.getBoolean("b15"), c.getInt("id"),
-                c.getString("coverUrl"), c.optString("coverAsset"), coverFile(context, c.getString("coverUrl")).takeIf { it.exists() })
+                c.getString("coverUrl"), c.optString("coverAsset"), coverFile(context, c.getString("coverUrl")))
         }.also { chartCache = it }
     }
 
     fun updateCovers(progress: (String) -> Unit): CatalogResult {
-        val played = cached()?.scores?.map { it.address }?.toSet().orEmpty()
+        val played = (cached()?.scores.orEmpty() + manualSnapshot().scores).map { it.address }.toSet()
         val result = CatalogUpdates(context).refresh(catalog(), played, progress)
         chartCache = null
         return result
@@ -115,6 +116,55 @@ class Repository(private val context: Context) {
 
     fun hasAccount() = accounts.read() != null
     fun cached(): Snapshot? = if (snapshotFile.exists()) parseSnapshot(JSONObject(snapshotFile.readText())) else null
+
+    fun manualCharts(): List<Chart> = charts.values.filter { it.difficulty != "chaotic" }
+        .sortedWith(compareByDescending<Chart> { it.constant }.thenBy { it.title }.thenBy { it.id })
+
+    private fun manualRaw(): JSONObject = if (manualFile.exists()) JSONObject(manualFile.readText()) else
+        JSONObject().put("manual", true).put("profile", JSONObject().put("username", "手动玩家")
+            .put("username_id", "MANUAL").put("rating", 0)).put("scores", JSONArray()).put("syncedAt", System.currentTimeMillis())
+
+    fun manualSnapshot(): Snapshot = parseSnapshot(manualRaw())
+
+    private fun saveManual(raw: JSONObject): Snapshot {
+        raw.put("syncedAt", System.currentTimeMillis())
+        writeAtomic(manualFile, raw.toString().toByteArray(Charsets.UTF_8))
+        return parseSnapshot(raw)
+    }
+
+    fun saveManualPlayer(name: String, tag: String): Snapshot {
+        if (name.trim().isEmpty() || name.trim().length > 32 || tag.trim().length > 32)
+            throw AppError("昵称不能为空，昵称和编号最多各 32 个字符。")
+        val raw = manualRaw()
+        raw.getJSONObject("profile").put("username", name.trim()).put("username_id", tag.trim().ifEmpty { "MANUAL" })
+        return saveManual(raw)
+    }
+
+    fun saveManualScore(address: String, value: Int, flags: Int): Snapshot {
+        val chart = charts[address] ?: throw AppError("谱面未收录，请先更新曲库。")
+        if (chart.difficulty == "chaotic" || value !in 0..1010000 || flags !in setOf(0, 4, 5, 7))
+            throw AppError("分数应为 0～1010000 的整数，CHAOTIC 不计入 B50。")
+        val raw = manualRaw()
+        val previous = raw.getJSONArray("scores")
+        val rows = JSONArray()
+        for (i in 0 until previous.length()) {
+            val row = previous.getJSONObject(i)
+            if (row.getString("chart_id") != address) rows.put(row)
+        }
+        rows.put(JSONObject().put("chart_id", address).put("score", value).put("grade", flags))
+        return saveManual(raw.put("scores", rows))
+    }
+
+    fun deleteManualScore(address: String): Snapshot {
+        val raw = manualRaw()
+        val previous = raw.getJSONArray("scores")
+        val rows = JSONArray()
+        for (i in 0 until previous.length()) {
+            val row = previous.getJSONObject(i)
+            if (row.getString("chart_id") != address) rows.put(row)
+        }
+        return saveManual(raw.put("scores", rows))
+    }
 
     private fun parseSnapshot(raw: JSONObject): Snapshot {
         val info = raw.getJSONObject("profile")
@@ -126,8 +176,9 @@ class Repository(private val context: Context) {
             val score = row.getInt("score")
             Score(address, score, row.optInt("grade"), chart, if (chart == null) 0 else singleRating(chart.constant, score))
         }
+        val manual = raw.optBoolean("manual", false)
         return Snapshot(Player(info.getString("username"), info.optString("username_id"),
-            info.optDouble("rating", 0.0) / 10000.0, avatarFile.takeIf { it.exists() }), scores, raw.getLong("syncedAt"))
+            info.optDouble("rating", 0.0) / 10000.0, avatarFile.takeIf { !manual && it.exists() }), scores, raw.getLong("syncedAt"), manual)
     }
 
     fun authorize(credential: JSONObject, progress: (String) -> Unit): Snapshot {
@@ -247,13 +298,15 @@ class Repository(private val context: Context) {
         val downloaded = coverFile(context, chart.coverUrl)
         if (downloaded.exists()) return BitmapFactory.decodeFile(downloaded.path)
         if (chart.coverAsset.isNotBlank()) return context.assets.open(chart.coverAsset).use { BitmapFactory.decodeStream(it) }
-        val hash = MessageDigest.getInstance("SHA-256").digest(chart.coverUrl.toByteArray()).joinToString("") { "%02x".format(it) }
-        val file = File(context.cacheDir, "covers/$hash.jpg")
-        if (!file.exists()) {
-            try { file.parentFile!!.mkdirs(); file.writeBytes(getBytes(chart.coverUrl)) }
+        val legacy = File(context.cacheDir, "covers/${downloaded.name}")
+        if (!downloaded.exists()) {
+            try {
+                writeAtomic(downloaded, if(legacy.exists()) legacy.readBytes() else getBytes(chart.coverUrl))
+                legacy.delete()
+            }
             catch (_: java.io.IOException) { return null }
         }
-        return BitmapFactory.decodeFile(file.path)
+        return BitmapFactory.decodeFile(downloaded.path)
     }
 
     fun render(snapshot: Snapshot): Rendered = B50Renderer(context, this).render(snapshot)

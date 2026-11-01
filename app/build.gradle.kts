@@ -10,8 +10,8 @@ android {
         applicationId = "site.local.paradigmchacha"
         minSdk = 31
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.2.0"
+        versionCode = 7
+        versionName = "0.3.3"
     }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
