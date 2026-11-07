@@ -41,7 +41,8 @@
 
 作者：**zako00001** · 邮箱 **1708108745@qq.com** · QQ **1708108745** · [GitHub 主页](https://github.com/zako00001)。
 
-版本更新内容仅在 [Releases](https://github.com/zako00001/paradigm-chacha-b/releases) 页面说明。
+详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 
 ## B50 计算说明
 
